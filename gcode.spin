@@ -2,11 +2,11 @@
 ' gCode parser demo, loosely based on ultimaker reprap firmware
 ' as found here: http://www.guthub.com/ultimaker/
 '
-' Version 0.1
+' Version 0.2
+' Changes
 '
 ' Copyright (c) Rob Schmersel
 '
-' Uses code from demo.spin by Dave Hein
 ' See end of file for terms of use.
 '******************************************************************************
 {{
@@ -91,7 +91,7 @@ OBJ
   conio  : "conio"                                  ' spinsim027 copy
   fileio : "fileio"                                 ' spinsim027 copy
   f      : "F32"                                    ' F32 v1.3
-  fs     : "FloatString"                            ' Replace F32 FloatString by FloatString v1.2
+  fs     : "FloatString"                            '
   motor  : "motor"                                  ' placeholder
 
 VAR
@@ -104,7 +104,7 @@ VAR
   BYTE debug                                        ' FALSE = do nothing, TRUE = print debug messages
   LONG lastline, lastcode
 
-PUB main | tokens[10], numtokens, cmd
+PUB main | tokens[10], numtokens, cmd, start, stop
   fileio.mount(16)                                  ' spinsim version: Mount SD card
   conio.start(31, 30, 0, 115200)                    ' spinsim version: Start serial connection
   f.start                                           ' Start F32 cog
@@ -127,11 +127,16 @@ PUB main | tokens[10], numtokens, cmd
       "h":                                          ' Help
         help
       "p":                                          ' Parse gCode
-        debug := TRUE
+        debug := FALSE
         lastline := 0
         lastcode := 0
         IF numtokens == 2
+          start := cnt
           parsefile(tokens[1])                      ' read file
+          stop := cnt
+          conio.str(STRING("Time to complete: "))
+          conio.dec((stop-start)/(CLKFREQ/1000000))
+          conio.tx(13)
         ELSE
           parse                                     ' Get user input
       "d":                                          ' List directory
@@ -155,14 +160,6 @@ PUB parsefile(fname) | char, prev, line, comment, r
   IFNOT fileio.popen(fname, "R")
     REPEAT WHILE fileio.pread(@char, 1) > 0  ' Read character until EOF
       CASE char
-        "*":                              ' Checksum marker
-          BYTE[line++] := " "             ' Add extra space to create seperate token
-                                          ' Remember not to use the extra space
-                                          ' in the checksum calculation !!
-        ";", "(":                         ' Skip comments
-          IFNOT comment
-            comment := TRUE
-            prev := char
         10,13:                            ' End of Line
           BYTE[line++]~                   ' Mark end of string
           IF line > @buffer + 1           ' skip empty lines
@@ -176,20 +173,17 @@ PUB parsefile(fname) | char, prev, line, comment, r
             ELSEIF r
               conio.str(STRING("OK "))
               conio.dec(lastline)
+              process_code
             ELSE
               conio.str(STRING("RESEND "))
               conio.dec(lastline+1)
             conio.tx(13)
           line := @buffer                 ' Reset line pointer
-          comment:= FALSE
           NEXT                            ' Next character
         0..31:                            ' Don't store control characters
           NEXT
-      IFNOT comment
-        BYTE[line++] := char              ' Store character if it is not part of a comment
-        'conio.tx(char)
-      IF char == ")"  AND prev == "("     ' End of comment, do not store the marker
-        comment := FALSE
+      BYTE[line++] := char                ' Store character
+      'conio.tx(char)
 
   ELSE
     conio.str(string("Could not open "))
@@ -209,129 +203,113 @@ PUB parse
     conio.tx(13)
 
 DAT
-  end BYTE "END",0
+  end_prog     BYTE "END",0
+  error_code   BYTE "Error: Invalid code: ",0
+  error_check  BYTE "Error: Check sum mismatch",0
+  error_line   BYTE "Error: Checksum without Linenumber",0
+  error_check1 BYTE "Error: Linenumber without Checksum",0
+  line_rec     BYTE ", Line received: ",0
 
-PUB parse_gcode(str) | numtokens, tokens[10], i, icode, count, checksum, axis, start, len
-{{ G-Code parser, limited set of codes is supported
-   Details on supported G-Codes can be found here:
-   http://objects.reprap.org/wiki/GCodes
-}}
-  IF BYTE[str] == "/"                     ' "/" indicates deleted block, commonly used for comments
-    RETURN TRUE                           ' Continue with the program
+PUB parse_gcode(str) | start, end, pos, char, prev, checksum, end_check, key, keyCode, comment
 
-  start := str                            ' Save start of buffer
-  len := STRSIZE(str)                     ' Original length of buffer
-
-  '*************************************************************
-  ' Get all parameters
-  '*************************************************************
-
-  seen := 0                               ' Have seen nothing yet
-  count := 0
-  numtokens := tokenize(str, @tokens)     ' split line in tokens
-  IF numtokens == 0                       ' empty line or comment
-    RETURN TRUE                           ' continue
-  IF STRCOMP(tokens[0], @end)             ' END of program
+  IF LONG[str]&$FFF == LONG[@end_prog]
     RETURN 1
-  REPEAT numtokens                        ' Analyze tokens
-    i := BYTE[tokens[count]]              ' Get code
-    CASE i                                ' Check validity of code
-      "*":                                ' Checksum
-        i := _Cs
-        IF count < numtokens-1
+
+  comment~
+  seen~
+  checksum~
+
+  start := str
+  end := str + STRSIZE(str)
+
+  REPEAT WHILE str < end
+    char := BYTE[str++]
+    case char
+      "A".."Z","*":                       ' G-code, * = checksum
+        IFNOT comment
+          key := char -"A"                ' get index
+          if char == "*"                  ' * is special
+            key := _Cs
+            end_check := str -1           ' Save pointer to wher checksum should be calculated
+          keyCode := 1<<key               '
+          seen |= keyCode
+          IFNOT type & keyCode
+            code[key] := StringToInt(str, @pos)
+          ELSE
+            code[key] := StringToFloat(str, @pos)
+          str := pos                      ' Update pointer
+      "/", ";":                           ' Comment?
+        QUIT                              ' Comment until end of line, so stop parsing
+      "(":                                ' Comment
+        IFNOT comment
+          comment := TRUE
+          prev := char
+      ")":
+        IF comment AND prev == "("
+          comment := FALSE
+      " ":
+      OTHER:
+        IFNOT comment
           IF debug
-            conio.str(STRING("Error: gCodes after checksum",13))
-          RETURN FALSE
-      "A".."Z":                           ' Valid code
-        i -= "A"
-      OTHER:                              ' Invalid code
-        IF debug
-            conio.str(STRING("Error: Invalid gCode", 13))
-        RETURN FALSE
+            conio.str(@error_code)
+            conio.tx(char)
+            conio.str(@line_rec)
+            conio.str(start)
+            conio.tx(13)
+          RETURN 0
 
-    icode := 1<<i                         ' Index for seen and type bitmasks
-    seen |= icode                         ' Set seen bitmask
-    IF type & icode                       ' Check what parameter type is expected
-      code[i] :=  getfloat(tokens[count]) ' Get float value
-    ELSE
-      code[i] := getint(tokens[count])    ' Get integer value
-    count++
+  IFNOT seen                              ' Empty line
+    RETURN -1
 
-  ' Tokenizing breaks the buffer in multiple strings by replacing a space
-  ' with a '0' at the end of each token, fix it.
-  REPEAT len
-    IFNOT BYTE[str]
-      BYTE[str] := " "
-    str++
-  str := start                            ' Restore str pointer
-
-  '*************************************************************
-  ' Process code
-  '*************************************************************
-
-  ' Check checksum of this string. Flush buffers and re-request
-  ' line if error is found
-  IF (seen & (GCODE_Cs |GCODE_N)) == (GCODE_Cs | GCODE_N)
-    ' Calculate checksum.
-    ' The checksum is calculated from all characters until the *
-    ' As the checksum is the last token in the buffer, we can use this as
-    ' the limit for the calculation, but remember the additional space!
-    checksum := 0
-    REPEAT WHILE str < tokens[numtokens-1] - 1
+  ' checksum check
+  str := start
+  IF (seen & (GCODE_Cs | GCODE_N)) == (GCODE_Cs | GCODE_N)
+    ' Calculate checksum (xor al characters until teh checksum marker *
+    str := start
+    REPEAT WHILE str < end_check
       checksum ^= BYTE[str++]
-    str := start                          ' Reset str pointer
     IF checksum <> code[_Cs]
+      ' Checksums are not equal
       IF debug
-        conio.str(STRING("Serial Error: checksum mismatch. Remote ("))
-        conio.dec(code[_Cs])
-        conio.str(STRING(") not equal to local ("))
-        conio.dec(checksum)
-        conio.str(STRING("), line received: "))
-        conio.str(str)
+        conio.str(@error_check)
+        conio.str(@line_rec)
+        conio.str(start)
         conio.tx(13)
-      RETURN FALSE
+      RETURN 0
+  ELSEIF (seen & (GCODE_Cs | GCODE_N)) == GCODE_Cs
+    ' Checksum wihtout Linenumber
+    IF debug
+      conio.str(@error_check1)
+      conio.str(@line_rec)
+      conio.str(start)
+      conio.tx(13)
+    RETURN 0
+  ELSEIF  (seen & (GCODE_Cs | GCODE_N)) == GCODE_N
+    ' Linenumber without Checksum
+    IF debug
+      conio.str(@error_line)
+      conio.str(@line_rec)
+      conio.str(start)
+      conio.tx(13)
+    RETURN 0
 
-    ' Check that this lineNr is LastLineNrRecieved+1. If not, flush
-    IF NOT((seen & GCODE_M) > 0 AND code[_M] == 110) ' unless this is a reset-lineNr command
-      IF code[_N] <> lastline+1
-        IF debug
-          conio.str(STRING("Serial Error: Linenumber ("))
-          conio.dec(code[_N])
-          conio.str(STRING(") is not last + 1 ("))
-          conio.dec(lastline+1)
-          conio.str(STRING("), line received: "))
-          conio.str(str)
-          conio.tx(13)
-        RETURN FALSE
-  ELSEIF seen & (GCODE_Cs | GCODE_N) == GCODE_Cs
-    conio.str(STRING("Error: checksum without line number. Checksum:"))
-    conio.dec(code[_Cs])
-    conio.str(STRING(", line received: "))
-    conio.str(str)
-    conio.tx(13)
-    RETURN FALSE
-  ELSEIF seen & (GCODE_Cs | GCODE_N) == GCODE_N
-    conio.str(STRING("Error: line number without checksum. Linenumber:"))
-    conio.dec(code[_N])
-    conio.str(STRING(", line received: "))
-    conio.str(str)
-    conio.tx(13)
-    RETURN FALSE
-
-  ' if no command was seen, but parameters were, then use the last G code as
-  ' the current command
-  IF (seen & (GCODE_G | GCODE_M | GCODE_T)) == 0
+  IFNOT (seen & (GCODE_G | GCODE_M | GCODE_T))
     code[_G] := lastcode
     seen |= GCODE_G
 
   IF debug
-    conio.str(STRING("Line received: "))
-    conio.str(str)
+    conio.str(@line_rec)
+    conio.str(start)
     conio.tx(13)
-    conio.str(STRING("codes seen: "))
+    conio.str(STRING("Code seen: "))
+
     conio.bin(seen,32)
     conio.tx(13)
 
+  lastline++
+  RETURN -1
+
+PUB process_code
   '*************************************************************
   ' CODE BELOW COMPILES, BUT IS NOT YET CHECKED FOR CORRECTNESS
   ' ATLEAST THE CODE CONCERNING COORDINATES IS NOT CORRECT
@@ -527,24 +505,9 @@ PUB gets(str) | char, prev, start, comment
   REPEAT
     char := conio.rx
     case char
-      "*":                                ' Checksum marker
-        BYTE[str++] := " "                ' Add extra space to create seperate token
-                                          ' Remember not to include the extra
-                                          ' space in the checksum calculation !!
-      ";", "(":                           ' Do not store comments
-        comment := TRUE
-        IFNOT prev == ";"
-          prev := char
       8:                                  ' Backspace
         IF str > start                    ' Make sure we do not remove past the start of the buffer
           char := BYTE[str--]             ' Remove character from buffer
-          IF char == ";"                  ' Make sure to get comment mode correctly
-            comment := FALSE              ' Leave comment mode
-          IF char == "(" AND prev <> ":"
-            comment := FALSE              ' Leave comment mode
-          IF char == ")" AND prev <> ";"
-            comment := TRUE
-            prev := "("
           conio.tx(8)                     ' Remove character from screen
           conio.tx(" ")
           conio.tx(8)
@@ -555,17 +518,8 @@ PUB gets(str) | char, prev, start, comment
         RETURN
       0..31:                              ' Don't show or store control characters
         NEXT
-    conio.tx(char)                    ' Echo character
-    IFNOT comment
-      BYTE[str++] := char             ' Store character if it is not part of a comment
-    ELSEIF char == ")"  AND prev == "(" ' End of comment
-      comment := FALSE
-
-PUB getint(str) | v
-  RETURN f.FTrunc(fs.StringToFloat(++str))
-
-PUB getfloat(str) :value
-  RETURN fs.StringToFloat(++str)
+    conio.tx(char)                        ' Echo character
+    BYTE[str++] := char                   ' Store character if it is not part of a comment
 
 PUB tokenize(str, tokens)
   REPEAT 10
@@ -587,6 +541,65 @@ PUB skipblanks(str)
   REPEAT WHILE BYTE[str] AND BYTE[str] == " "
     str++
   RETURN str
+
+PUB StringToInt(str, pos) : int | ssign
+  int~
+  ssign~
+  repeat
+    case byte[str]
+      "+":
+      "-":
+        ssign~~
+      "0".."9":
+        int := int * 10 + byte[str] - "0"
+      other:
+        quit
+    ++str
+
+  LONG[pos] := str
+
+PUB StringToFloat(str, pos) : flt | significand, ssign, places, exp
+  significand~
+  ssign~
+  exp~
+  places~
+  repeat
+    case byte[str]
+      "+":
+      "-":
+        ssign~~
+      ".":
+        places := 1
+      "0".."9":
+        significand := significand * 10 + byte[str] - "0"
+        if places
+          ++places                    'count decimal places
+      other:
+        quit
+    ++str
+
+  LONG[pos] := str
+
+  if ssign
+    -significand
+  flt := f.FFloat(significand)
+
+  if places
+    exp += places - 1
+
+  flt := f.FMul(flt, tenf[exp])              'adjust flt's decimal point
+
+DAT
+
+tenf    long  1e+00, 1e-01, 1e-02, 1e-03, 1e-04, 1e-05, 1e-06, 1e-07, 1e-08, 1e-09
+        long  1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15, 1e-16, 1e-17, 1e-18, 1e-19
+        long  1e-20, 1e-21, 1e-22, 1e-23, 1e-24, 1e-25, 1e-26, 1e-27, 1e-28, 1e-29
+        long  1e-30, 1e-31, 1e-32, 1e-33, 1e-34, 1e-35, 1e-36, 1e-37, 1e-38
+
+
+
+
+
 {{
 +------------------------------------------------------------------------------------------------------------------------------+
 |                                                   TERMS OF USE: MIT License                                                  |
